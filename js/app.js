@@ -18,7 +18,8 @@
     rateIdx: 3, reminder: false, paused: false, index: null, worker: null, stream: null, track: null,
     torch: false, current: null, lastSeenAt: 0, pending: { name: null, t: 0 }, voiceLocked: false,
     pendingSpeech: null, announceToken: 0, misses: 0, lastHelp: 0, modeIdx: 0, ready: false, welcomed: false,
-    swallowClick: false, wake: null, suppressUntil: 0
+    swallowClick: false, wake: null, suppressUntil: 0,
+    vision: false, artIndex: null, vTick: 0, vCursor: 0, vPref: null, noQuad: 0, unreadSince: 0, visionFails: 0
   };
 
   /* ---------- settings ---------- */
@@ -279,11 +280,11 @@
     return out;
   }
 
-  function decide(m) {
+  // Two sightings needed unless `strong`. A miss never cancels a pending guess.
+  function decide(m, forcePending) {
     var now = Date.now();
-    // A miss doesn't cancel a pending guess: the two page modes often disagree scan to scan.
     if (!m || m.sim < T_LOW) return null;
-    var strong = m.sim >= T_HIGH && (m.key.length >= 5 || m.sim >= 0.999);
+    var strong = !forcePending && m.sim >= T_HIGH && (m.key.length >= 5 || m.sim >= 0.999);
     if (strong) return m.name;
     if (state.pending.name === m.name && now - state.pending.t < 10000) { state.pending = { name: null, t: 0 }; return m.name; }
     state.pending = { name: m.name, t: now };
@@ -291,12 +292,42 @@
   }
 
   var DEBUG = /[?&]debug/.test(location.search);
-  function showDebug(mode, lines, m, ms) {
+  function dbg(o) {
+    state.debug = o;
+    if (!DEBUG) return;
     el.debug.hidden = false;
-    el.debug.textContent = 'psm ' + mode + '  ' + ms + ' ms  lines ' + lines.length + '\nmatch: ' + (m ? m.name + ' (' + m.sim.toFixed(2) + ') from "' + m.line + '"' : 'none') + '\n' + lines.slice(0, 6).map(function (l) { return '> ' + l.text; }).join('\n');
+    el.debug.textContent = Object.keys(o).map(function (k) { return k + ': ' + (typeof o[k] === 'object' ? JSON.stringify(o[k]) : o[k]); }).join('\n');
   }
 
-  function scanOnce() {
+  // Shared tail of every scan: announce, re-arm, or nudge the user.
+  function afterMatch(name, m, hadQuad, textual) {
+    var now = Date.now();
+    if (now < state.suppressUntil) name = null;
+    if (m && state.current && m.name === state.current.name && m.sim >= T_LOW) state.lastSeenAt = now;
+    if (name) {
+      state.misses = 0; state.unreadSince = 0;
+      var same = state.current && state.current.name === name;
+      if (same && now - state.lastSeenAt < 4500) { state.lastSeenAt = now; return; }
+      return announce(name);
+    }
+    if (hadQuad) {
+      if (!state.unreadSince) state.unreadSince = now;
+      if (now - state.unreadSince > 7000 && now - state.lastHelp > 25000) {
+        state.unreadSince = 0; state.lastHelp = now;
+        say(["I can see a card but can't read its name. Try more light, hold it flat and steady, with the name at the top."]);
+      }
+      return;
+    }
+    state.unreadSince = 0;
+    if (textual >= 4) state.misses++;
+    if (state.misses >= 6 && now - state.lastHelp > 25000) {
+      state.misses = 0; state.lastHelp = now;
+      say(["I can't read a card. Try more light, and hold the card flat and steady with the name at the top."]);
+    }
+  }
+
+  /* ----- slow path: OCR the whole frame (used when the card outline can't be found) ----- */
+  function scanFullFrame() {
     var frame = grabFrame();
     if (!frame) return Promise.resolve();
     var t0 = Date.now();
@@ -306,31 +337,134 @@
     }).then(function (res) {
       var lines = extractLines(res.data);
       var m = CardMatch.pick(state.index, lines);
-      state.debug = { mode: mode, lines: lines.map(function (l) { return l.text; }).slice(0, 12), match: m ? { name: m.name, sim: m.sim, line: m.line } : null };
-      if (DEBUG) showDebug(mode, lines, m, Date.now() - t0);
-      var name = decide(m);
-      var now = Date.now();
-      if (now < state.suppressUntil) name = null;
-      if (m && state.current && m.name === state.current.name && m.sim >= T_LOW) state.lastSeenAt = now;
-      if (name) {
-        state.misses = 0;
-        var same = state.current && state.current.name === name;
-        if (same && now - state.lastSeenAt < 4500) { state.lastSeenAt = now; return; }
-        return announce(name);
-      }
+      dbg({ path: 'whole-frame OCR (psm ' + mode + ')', ms: Date.now() - t0, match: m ? m.name + ' ' + m.sim.toFixed(2) : 'none', lines: lines.slice(0, 5).map(function (l) { return l.text; }) });
       var textual = lines.filter(function (l) { return /[A-Za-z]{4}/.test(l.text); }).length;
-      if (textual >= 4) state.misses++;
-      if (state.misses >= 6 && now - state.lastHelp > 25000) {
-        state.misses = 0; state.lastHelp = now;
-        say(["I can't read a card. Try more light, and hold the card flat and steady with the name at the top."]);
-      }
+      return afterMatch(decide(m), m, false, textual);
     });
   }
+
+  /* ----- fast path: find the card, flatten it, read only the title bar, cross-check the art ----- */
+  var VARIANTS = [[0, false], [0, true], [-0.02, false], [0.02, false], [-0.02, true], [0.02, true]]; // [title crop shift, upside-down]
+  var fullC = document.createElement('canvas'), detC = document.createElement('canvas');
+  function drawFrames() {
+    var vw = el.video.videoWidth, vh = el.video.videoHeight;
+    if (!vw || !vh) return null;
+    var s1 = Math.min(1, 1280 / Math.max(vw, vh));
+    fullC.width = Math.round(vw * s1); fullC.height = Math.round(vh * s1);
+    fullC.getContext('2d', { willReadFrequently: true }).drawImage(el.video, 0, 0, fullC.width, fullC.height);
+    var s2 = Math.min(1, 640 / Math.max(fullC.width, fullC.height));
+    detC.width = Math.round(fullC.width * s2); detC.height = Math.round(fullC.height * s2);
+    detC.getContext('2d', { willReadFrequently: true }).drawImage(fullC, 0, 0, detC.width, detC.height);
+    return { ds: detC.width / fullC.width };
+  }
+  function nextVariantIdx() {
+    var t = state.vTick++;
+    if (state.vPref !== null && t % 2 === 0) return state.vPref;
+    return state.vCursor++ % VARIANTS.length;
+  }
+
+  function collectIds(c) {
+    var out = [];
+    if (c.illustration_id) out.push(c.illustration_id);
+    (c.card_faces || []).forEach(function (f) { if (f.illustration_id) out.push(f.illustration_id); });
+    return out;
+  }
+  function getPrintIds(card) {
+    var own = collectIds(card), url = card.prints_search_uri;
+    if (!url) return Promise.resolve(own);
+    return openCache('cardreader-prints-v1').then(function (cache) {
+      return (cache ? cache.match(url) : Promise.resolve(null)).then(function (hit) {
+        if (hit) return hit.json();
+        var ctl = new AbortController(), to = setTimeout(function () { ctl.abort(); }, 5000);
+        return fetch(url, { headers: { Accept: 'application/json;q=0.9,*/*;q=0.8' }, signal: ctl.signal }).then(function (r) {
+          clearTimeout(to);
+          if (!r.ok) return null;
+          if (cache) cache.put(url, r.clone());
+          return r.json();
+        });
+      });
+    }).then(function (j) {
+      var ids = own.slice();
+      if (j && j.data) j.data.forEach(function (c) { collectIds(c).forEach(function (i) { if (ids.indexOf(i) < 0) ids.push(i); }); });
+      return ids;
+    }).catch(function () { return own; });
+  }
+  // Smallest art-hash distance between the scan and any printing of this card (null = can't tell).
+  function hashDistance(name, hashes) {
+    return getCard(name).then(function (card) {
+      if (!card || /Basic Land/.test(card.type_line || '')) return null;
+      return getPrintIds(card).then(function (ids) { return ids.length ? Vision.distanceTo(state.artIndex, hashes, ids) : null; });
+    }).catch(function () { return null; });
+  }
+
+  // Turn title candidates (+ optional art hashes) into {name, m, strong}.
+  function evaluate(cands, hashes) {
+    if (!cands.length) return Promise.resolve(null);
+    var top = cands[0];
+    if (top.sim >= 0.97) return Promise.resolve({ name: top.name, m: top, strong: true, via: 'title' });
+    if (!hashes) return Promise.resolve({ name: top.name, m: top, strong: false, via: 'title' });
+    return Promise.all(cands.slice(0, 3).map(function (c) {
+      return hashDistance(c.name, hashes).then(function (d) { return { c: c, dist: d }; });
+    })).then(function (rs) {
+      var best = null;
+      rs.forEach(function (r) {
+        var bonus = r.dist === null ? 0 : r.dist <= 340 ? 0.15 : r.dist <= 400 ? 0.08 : r.dist >= 460 ? -0.1 : 0;
+        r.score = r.c.sim + bonus;
+        if (!best || r.score > best.score) best = r;
+      });
+      var contradicts = best.dist !== null && best.dist >= 460;
+      return { name: best.c.name, m: best.c, strong: best.score >= 0.9 && !contradicts, via: 'title+art', dist: best.dist,
+               table: rs.map(function (r) { return r.c.name + ' ' + r.c.sim.toFixed(2) + ' d=' + r.dist; }) };
+    });
+  }
+
+  function scanCard() {
+    var f = drawFrames();
+    if (!f) return Promise.resolve();
+    var t0 = performance.now(), quad = Vision.detect(detC), tDet = performance.now() - t0;
+    if (!quad) {
+      state.noQuad++;
+      dbg({ path: 'no card outline found', detect_ms: Math.round(tDet), fallbacks: Math.floor(state.noQuad / 4) });
+      state.unreadSince = 0;
+      return state.noQuad % 4 === 0 ? scanFullFrame() : Promise.resolve();
+    }
+    state.noQuad = 0;
+    var warped = Vision.warp(fullC, quad.pts, 1 / f.ds);
+    var vi = nextVariantIdx(), v = VARIANTS[vi], t1 = performance.now();
+    var titleC;
+    try { titleC = Vision.titleCanvas(warped, v[1], v[0]); } catch (e) { warped.delete(); throw e; }
+    return state.worker.setParameters({ tessedit_pageseg_mode: '7' }).then(function () {
+      return state.worker.recognize(titleC, {}, { blocks: true });
+    }).then(function (res) {
+      var tOcr = performance.now() - t1;
+      var lines = extractLines(res.data);
+      var cands = CardMatch.candidates(state.index, lines, 4).filter(function (c) { return c.sim >= 0.5; });
+      var hashes = null;
+      if (cands.length && cands[0].sim < 0.97 && state.artIndex) hashes = Vision.artHashes(warped, v[1]);
+      warped.delete(); warped = null;
+      return evaluate(cands, hashes).then(function (r) {
+        var name = null;
+        if (r) {
+          name = r.strong ? r.name : decide(r.m, true);
+          if (name) state.vPref = vi;
+        }
+        dbg({ path: 'card outline (' + quad.how + ') + title OCR', variant: vi, detect_ms: Math.round(tDet), ocr_ms: Math.round(tOcr),
+              read: lines.map(function (l) { return l.text; }), best: r ? r.name + ' sim ' + r.m.sim.toFixed(2) + ' via ' + r.via + (r.dist !== undefined ? ' dist ' + r.dist : '') : 'none',
+              candidates: r && r.table ? r.table : undefined, decision: name || (r ? 'waiting for a second look' : 'no match') });
+        return afterMatch(name, r ? r.m : null, true, 0);
+      });
+    }).catch(function (e) { if (warped) warped.delete(); throw e; });
+  }
+
+  function scanOnce() { return state.vision ? scanCard() : scanFullFrame(); }
 
   function loop() {
     if (!state.ready) return;
     if (state.paused || document.hidden || !state.stream) { setTimeout(loop, 400); return; }
-    scanOnce().catch(function () {}).then(function () { setTimeout(loop, 200); });
+    scanOnce().then(function () { state.visionFails = 0; }, function () {
+      // If the fast path keeps crashing, quietly go back to plain whole-frame reading.
+      if (state.vision && ++state.visionFails >= 5) { state.vision = false; dbg({ path: 'card finder turned off after errors' }); }
+    }).then(function () { setTimeout(loop, state.vision ? 60 : 200); });
   }
 
   /* ---------- controls ---------- */
@@ -402,6 +536,18 @@
   }
   el.btnRetry.addEventListener('click', function () { location.reload(); });
 
+  function loadVision() {
+    if (typeof Vision === 'undefined') return;
+    var base = new URL('.', location.href).href;
+    Vision.load(base).then(function (ok) {
+      if (!ok) return;
+      state.vision = true;
+      return fetch(base + 'vendor/art_index.bin').then(function (r) { return r.ok ? r.arrayBuffer() : null; })
+        .then(function (buf) { if (buf) state.artIndex = Vision.parseIndex(buf); })
+        .catch(function () {});
+    });
+  }
+
   function init() {
     loadSettings(); syncReminderButton();
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(function () {});
@@ -435,6 +581,7 @@
         say(['Ready. Hold a card upright, with its name at the top.']);
       }
       loop();
+      loadVision();
     }).catch(function (err) {
       if (!el.fatal.hidden) return;
       var offline = navigator.onLine === false;

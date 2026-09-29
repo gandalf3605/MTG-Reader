@@ -89,6 +89,26 @@
   }
 
   // Mana symbols on the title bar often come out as stray "words" like O, OO, (Q, @@, 0O0.
+  // Top-k distinct card names for one compacted query.
+  function topFor(index, q, k) {
+    if (q.length < 3) return [];
+    var tg = trigrams(q), touched = [], hits = index.hits, uniq = {};
+    tg.forEach(function (t) {
+      if (uniq[t]) return; uniq[t] = 1;
+      var list = index.post[t]; if (!list) return;
+      for (var i = 0; i < list.length; i++) { var id = list[i]; if (hits[id] === 0) touched.push(id); hits[id]++; }
+    });
+    var cand = touched.map(function (id) { return { id: id, dice: 2 * hits[id] / (tg.length + index.tcount[id]) }; })
+      .sort(function (a, b) { return b.dice - a.dice; }).slice(0, 30);
+    touched.forEach(function (id) { hits[id] = 0; });
+    var byName = {};
+    cand.forEach(function (c) {
+      var sim = similarity(q, index.keys[c.id]), nm = index.names[index.owner[c.id]];
+      if (!byName[nm] || sim > byName[nm].sim) byName[nm] = { name: nm, sim: sim, key: index.keys[c.id] };
+    });
+    return Object.keys(byName).map(function (n) { return byName[n]; }).sort(function (a, b) { return b.sim - a.sim; }).slice(0, k);
+  }
+
   function isJunkWord(w) {
     var raw = w.text || '';
     var t = raw.replace(/[^A-Za-z]/g, '');
@@ -173,5 +193,24 @@
     return best;
   }
 
-  return { mergeRows: mergeRows, compact: compact, lev: lev, similarity: similarity, buildIndex: buildIndex, bestFor: bestFor, pick: pick };
+  // Like pick(), but returns the best few distinct candidates (for cross-checking with the art hash).
+  function candidates(index, lines, k) {
+    var real = lines.filter(function (l) { return l.words && l.words.length && /[A-Za-z]{3}/.test(l.text); });
+    if (!real.length) return [];
+    var all = real.concat(mergeRows(real)), byName = {};
+    all.forEach(function (l) {
+      variants(l.words).forEach(function (v) {
+        var q = compact(v.map(function (w) { return w.text; }).join(' '));
+        var list = topFor(index, q, k).map(function (m) { return { m: m, pen: 0 }; });
+        tailVariants(q).forEach(function (t) { topFor(index, t, k).forEach(function (m) { list.push({ m: m, pen: 0.03 }); }); });
+        list.forEach(function (e) {
+          var sim = e.m.sim - e.pen;
+          if (!byName[e.m.name] || sim > byName[e.m.name].sim) byName[e.m.name] = { name: e.m.name, sim: sim, key: e.m.key, line: l.text };
+        });
+      });
+    });
+    return Object.keys(byName).map(function (n) { return byName[n]; }).sort(function (a, b) { return b.sim - a.sim; }).slice(0, k);
+  }
+
+  return { candidates: candidates, topFor: topFor, mergeRows: mergeRows, compact: compact, lev: lev, similarity: similarity, buildIndex: buildIndex, bestFor: bestFor, pick: pick };
 });
