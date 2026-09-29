@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spoken Card Reader</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="description" content="Point your phone at a Magic: The Gathering card and hear its game information read aloud. Built for players who are blind or have low vision.">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<main id="app">
+  <header id="statusbar">
+    <div id="status">Starting camera…</div>
+    <div id="sr" class="sr-only" role="status" aria-live="polite"></div>
+    <div id="banner" hidden>Tap anywhere to turn on voice</div>
+  </header>
+
+  <section id="stage" role="button" tabindex="0" aria-label="Camera view. Double tap to hear the current card again.">
+    <video id="video" playsinline muted autoplay aria-hidden="true"></video>
+    <div id="guide" aria-hidden="true"><span>Name at top</span></div>
+    <pre id="debug" aria-hidden="true" hidden></pre>
+    <div id="readout" aria-hidden="true" hidden>
+      <h1 id="readName"></h1>
+      <div id="readText"></div>
+    </div>
+  </section>
+
+  <nav id="controls" aria-label="Controls">
+    <button id="btnRepeat" type="button">Repeat</button>
+    <button id="btnPause" type="button" aria-pressed="false">Pause scanning</button>
+    <button id="btnSlower" type="button" aria-label="Speak slower">Slower</button>
+    <button id="btnFaster" type="button" aria-label="Speak faster">Faster</button>
+    <button id="btnReminder" type="button" aria-pressed="false">Reminder text: off</button>
+    <button id="btnTorch" type="button" aria-pressed="false" hidden>Light: off</button>
+    <button id="btnType" type="button">Type a name</button>
+    <button id="btnAbout" type="button">About</button>
+  </nav>
+
+  <form id="typeBox" hidden>
+    <label for="typeInput">Card name</label>
+    <input id="typeInput" type="text" autocomplete="off" autocapitalize="words" spellcheck="false" enterkeyhint="go">
+    <button type="submit">Read card</button>
+    <button type="button" id="typeClose">Close</button>
+  </form>
+
+  <section id="about" hidden aria-label="About">
+    <h2>About this reader</h2>
+    <p>Hold a Magic card upright with its name at the top. The reader finds the name, looks the card up, and reads the game text aloud: name, type, mana cost, power and toughness, and rules. Tap the screen to hear it again.</p>
+    <p>Camera pictures stay on your phone. Only the card name is sent to Scryfall to look up the card.</p>
+    <p>It reads what is on the card in your camera. Printing details like set and year are left out on purpose, because the rules text is the same on every printing.</p>
+    <p>The first time you open it, it needs the internet to download the reader and the card list. After that, cards you have already scanned work without a connection.</p>
+    <p class="fine">Card data from Scryfall. This app is unofficial Fan Content permitted under the Fan Content Policy. Not approved or endorsed by Wizards of the Coast. Portions of the materials used are property of Wizards of the Coast. ©Wizards of the Coast LLC. Text recognition by Tesseract.js (Apache 2.0).</p>
+    <button type="button" id="aboutClose">Close</button>
+  </section>
+
+  <section id="fatal" hidden role="alert">
+    <h2 id="fatalTitle"></h2>
+    <p id="fatalBody"></p>
+    <button type="button" id="btnRetry">Try again</button>
+  </section>
+</main>
+<script src="vendor/tesseract.min.js"></script>
+<script src="js/script.js"></script>
+<script src="js/match.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
