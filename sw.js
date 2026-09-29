@@ -1,6 +1,6 @@
 /* Offline shell + runtime cache for the reader's own files (never touches Scryfall requests). */
-const VERSION = 'reader-v2';
-const SHELL = ['./', 'index.html', 'css/app.css', 'js/app.js', 'js/script.js', 'js/match.js', 'js/vision.js',
+const VERSION = 'reader-v3';
+const SHELL = ['./', 'index.html', 'css/app.css', 'js/app.js', 'js/script.js', 'js/match.js', 'js/vision.js', 'js/recognize.js',
   'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
   'vendor/tesseract.min.js', 'vendor/worker.min.js'];
 

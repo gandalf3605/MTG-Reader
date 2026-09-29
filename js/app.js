@@ -19,7 +19,7 @@
     torch: false, current: null, lastSeenAt: 0, pending: { name: null, t: 0 }, voiceLocked: false,
     pendingSpeech: null, announceToken: 0, misses: 0, lastHelp: 0, modeIdx: 0, ready: false, welcomed: false,
     swallowClick: false, wake: null, suppressUntil: 0,
-    vision: false, artIndex: null, vTick: 0, vCursor: 0, vPref: null, noQuad: 0, unreadSince: 0, visionFails: 0
+    vision: false, artIndex: null, vTick: 0, vCursor: 0, vPref: null, noQuad: 0, unreadSince: 0, visionFails: 0, lastLookupMsg: 0
   };
 
   /* ---------- settings ---------- */
@@ -85,8 +85,43 @@
   });
 
   /* ---------- Scryfall (cached) ---------- */
-  function fetchJson(url) {
-    return fetch(url, { headers: { Accept: 'application/json;q=0.9,*/*;q=0.8' } });
+  var HDRS = { Accept: 'application/json;q=0.9,*/*;q=0.8' };
+  // All Scryfall traffic goes through here: one at a time, >=130 ms apart (under their 10/s limit),
+  // identical requests share one answer, every request has a timeout, and failures back off.
+  var Net = { last: 0, chain: Promise.resolve(), inflight: {}, backoffUntil: 0, failStreak: 0 };
+  function netBusy() { return Date.now() < Net.backoffUntil; }
+  function fetchJson(url, timeoutMs) {
+    // used for the one-off card-name catalog (big, so a long timeout)
+    var ctl = new AbortController(), to = setTimeout(function () { ctl.abort(); }, timeoutMs || 30000);
+    return fetch(url, { headers: HDRS, signal: ctl.signal }).then(function (r) { clearTimeout(to); return r; }, function (e) { clearTimeout(to); throw e; });
+  }
+  // Resolves to a Response (ok or 404) or null when the network/limit failed.
+  function scryfall(url) {
+    if (netBusy()) return Promise.resolve(null);
+    if (Net.inflight[url]) return Net.inflight[url];
+    var p = new Promise(function (resolve) {
+      Net.chain = Net.chain.then(function () {
+        var wait = Math.max(0, Net.last + 130 - Date.now());
+        return new Promise(function (r) { setTimeout(r, wait); });
+      }).then(function () {
+        if (netBusy()) return null;
+        Net.last = Date.now();
+        var ctl = new AbortController(), to = setTimeout(function () { ctl.abort(); }, 5000);
+        return fetch(url, { headers: HDRS, signal: ctl.signal }).then(function (r) {
+          clearTimeout(to);
+          if (r.status === 429 || r.status >= 500) throw new Error('busy ' + r.status);
+          Net.failStreak = 0;
+          return r;
+        }).catch(function () {
+          clearTimeout(to);
+          Net.failStreak++;
+          Net.backoffUntil = Date.now() + Math.min(15000, 1500 * Math.pow(2, Net.failStreak - 1));
+          return null;
+        });
+      }).then(resolve);
+    }).then(function (r) { delete Net.inflight[url]; return r; });
+    Net.inflight[url] = p;
+    return p;
   }
   function openCache(name) { return window.caches ? caches.open(name) : Promise.resolve(null); }
 
@@ -117,21 +152,33 @@
     });
   }
 
+  var cardMem = {}, missMem = {}; // name -> card | name -> time of last "not found"
   function getCard(name) {
+    if (cardMem[name]) return Promise.resolve(cardMem[name]);
+    if (missMem[name] && Date.now() - missMem[name] < 60000) return Promise.resolve(null);
     var exact = API + '/cards/named?exact=' + encodeURIComponent(name);
     var fuzzy = API + '/cards/named?fuzzy=' + encodeURIComponent(name);
     return openCache('cardreader-cards-v1').then(function (cache) {
       function lookup(url) {
         return (cache ? cache.match(url) : Promise.resolve(null)).then(function (hit) {
           if (hit) return hit.json();
-          return fetchJson(url).then(function (r) {
-            if (!r.ok) return null;
+          return scryfall(url).then(function (r) {
+            if (!r) return undefined;            // network trouble (don't remember as "not found")
+            if (!r.ok) return null;              // Scryfall says no such card
             if (cache) cache.put(url, r.clone());
             return r.json();
           });
         });
       }
-      return lookup(exact).then(function (c) { return c || lookup(fuzzy); });
+      return lookup(exact).then(function (c) {
+        if (c) return c;
+        if (c === undefined) return undefined;
+        return lookup(fuzzy);
+      });
+    }).then(function (c) {
+      if (c) { cardMem[name] = c; return c; }
+      if (c === null) missMem[name] = Date.now();
+      return null;
     }).catch(function () { return null; });
   }
 
@@ -156,13 +203,17 @@
   }
 
   function announce(name) {
+    if (netBusy() && !cardMem[name]) { setStatus('Card lookup is busy. Trying again in a moment.'); return Promise.resolve(); }
     var token = ++state.announceToken;
     setStatus('Found ' + name + '…');
     return getCard(name).then(function (card) {
       if (token !== state.announceToken) return;
       if (!card) {
-        var msg = 'I found ' + name + ' but could not look it up. Check your connection.';
-        setStatus(msg); say([msg]); return;
+        var now = Date.now();
+        var msg = netBusy() ? 'Card lookup is busy. Trying again in a moment.' : 'I found ' + name + ' but could not look it up. Check your connection.';
+        setStatus(msg);
+        if (now - state.lastLookupMsg > 20000) { state.lastLookupMsg = now; say([msg]); }
+        return;
       }
       state.current = { name: name, card: card };
       state.lastSeenAt = Date.now();
@@ -284,6 +335,9 @@
   function decide(m, forcePending) {
     var now = Date.now();
     if (!m || m.sim < T_LOW) return null;
+    // Short names are easy to hit by accident from OCR noise, so they need a closer match.
+    if (m.key.length <= 4 && m.sim < 0.9) return null;
+    if (m.key.length < 7 && m.sim < 0.8) return null;
     var strong = !forcePending && m.sim >= T_HIGH && (m.key.length >= 5 || m.sim >= 0.999);
     if (strong) return m.name;
     if (state.pending.name === m.name && now - state.pending.t < 10000) { state.pending = { name: null, t: 0 }; return m.name; }
@@ -344,7 +398,8 @@
   }
 
   /* ----- fast path: find the card, flatten it, read only the title bar, cross-check the art ----- */
-  var VARIANTS = [[0, false], [0, true], [-0.02, false], [0.02, false], [-0.02, true], [0.02, true]]; // [title crop shift, upside-down]
+  var VARIANTS = window.Recognize ? Recognize.VARIANTS : [[0, false], [0, true], [-0.02, false], [0.02, false], [-0.02, true], [0.02, true]]; // [title crop shift, upside-down, 'g' grey | 'b' black-and-white]
+  var Finder = window.Recognize || Vision;
   var fullC = document.createElement('canvas'), detC = document.createElement('canvas');
   function drawFrames() {
     var vw = el.video.videoWidth, vh = el.video.videoHeight;
@@ -369,16 +424,16 @@
     (c.card_faces || []).forEach(function (f) { if (f.illustration_id) out.push(f.illustration_id); });
     return out;
   }
+  var printsMem = {};
   function getPrintIds(card) {
     var own = collectIds(card), url = card.prints_search_uri;
     if (!url) return Promise.resolve(own);
+    if (printsMem[url]) return Promise.resolve(printsMem[url]);
     return openCache('cardreader-prints-v1').then(function (cache) {
       return (cache ? cache.match(url) : Promise.resolve(null)).then(function (hit) {
         if (hit) return hit.json();
-        var ctl = new AbortController(), to = setTimeout(function () { ctl.abort(); }, 5000);
-        return fetch(url, { headers: { Accept: 'application/json;q=0.9,*/*;q=0.8' }, signal: ctl.signal }).then(function (r) {
-          clearTimeout(to);
-          if (!r.ok) return null;
+        return scryfall(url).then(function (r) {
+          if (!r || !r.ok) return undefined;
           if (cache) cache.put(url, r.clone());
           return r.json();
         });
@@ -386,15 +441,19 @@
     }).then(function (j) {
       var ids = own.slice();
       if (j && j.data) j.data.forEach(function (c) { collectIds(c).forEach(function (i) { if (ids.indexOf(i) < 0) ids.push(i); }); });
+      if (j) printsMem[url] = ids;                 // only remember complete answers
       return ids;
     }).catch(function () { return own; });
   }
-  // Smallest art-hash distance between the scan and any printing of this card (null = can't tell).
+  // Smallest art-hash distance between the scan and any printing of this card (null = can't tell yet).
+  // Never waits on the network: if the card's data isn't in memory it starts a background fetch and
+  // answers "can't tell" this time, so scanning stays fast.
   function hashDistance(name, hashes) {
-    return getCard(name).then(function (card) {
-      if (!card || /Basic Land/.test(card.type_line || '')) return null;
-      return getPrintIds(card).then(function (ids) { return ids.length ? Vision.distanceTo(state.artIndex, hashes, ids) : null; });
-    }).catch(function () { return null; });
+    var card = cardMem[name];
+    if (!card) { getCard(name); return Promise.resolve(null); }
+    if (/Basic Land/.test(card.type_line || '')) return Promise.resolve(null);
+    if (card.prints_search_uri && !printsMem[card.prints_search_uri]) { getPrintIds(card); return Promise.resolve(null); }
+    return getPrintIds(card).then(function (ids) { return ids.length ? Vision.distanceTo(state.artIndex, hashes, ids) : null; }).catch(function () { return null; });
   }
 
   // Turn title candidates (+ optional art hashes) into {name, m, strong}.
@@ -403,9 +462,10 @@
     var top = cands[0];
     if (top.sim >= 0.97) return Promise.resolve({ name: top.name, m: top, strong: true, via: 'title' });
     if (!hashes) return Promise.resolve({ name: top.name, m: top, strong: false, via: 'title' });
-    return Promise.all(cands.slice(0, 3).map(function (c) {
+    return Promise.all(cands.slice(0, 2).filter(function (c) { return c.sim >= 0.6; }).map(function (c) {
       return hashDistance(c.name, hashes).then(function (d) { return { c: c, dist: d }; });
     })).then(function (rs) {
+      if (!rs.length) return { name: top.name, m: top, strong: false, via: 'title' };
       var best = null;
       rs.forEach(function (r) {
         var bonus = r.dist === null ? 0 : r.dist <= 340 ? 0.15 : r.dist <= 400 ? 0.08 : r.dist >= 460 ? -0.1 : 0;
@@ -421,7 +481,7 @@
   function scanCard() {
     var f = drawFrames();
     if (!f) return Promise.resolve();
-    var t0 = performance.now(), quad = Vision.detect(detC), tDet = performance.now() - t0;
+    var t0 = performance.now(), quad = Finder.detect(detC), tDet = performance.now() - t0;
     if (!quad) {
       state.noQuad++;
       dbg({ path: 'no card outline found', detect_ms: Math.round(tDet), fallbacks: Math.floor(state.noQuad / 4) });
@@ -429,16 +489,32 @@
       return state.noQuad % 4 === 0 ? scanFullFrame() : Promise.resolve();
     }
     state.noQuad = 0;
+    // When the main outline yields nothing readable, give the other candidate outlines (other cards in view) a turn, two looks each.
+    if (quad.others && quad.others.length) { var pool = [quad].concat(quad.others); quad = pool[Math.floor((state.quadFails || 0) / 2) % pool.length]; }
     var warped = Vision.warp(fullC, quad.pts, 1 / f.ds);
     var vi = nextVariantIdx(), v = VARIANTS[vi], t1 = performance.now();
-    var titleC;
-    try { titleC = Vision.titleCanvas(warped, v[1], v[0]); } catch (e) { warped.delete(); throw e; }
-    return state.worker.setParameters({ tessedit_pageseg_mode: '7' }).then(function () {
-      return state.worker.recognize(titleC, {}, { blocks: true });
-    }).then(function (res) {
-      var tOcr = performance.now() - t1;
-      var lines = extractLines(res.data);
-      var cands = CardMatch.candidates(state.index, lines, 4).filter(function (c) { return c.sim >= 0.5; });
+    function readMode(mode) {
+      var c;
+      try { c = Finder.titleCanvas(warped, v[1], v[0], mode); } catch (e) { return Promise.reject(e); }
+      return state.worker.setParameters({ tessedit_pageseg_mode: '7' }).then(function () {
+        return state.worker.recognize(c, {}, { blocks: true });
+      }).then(function (res) {
+        var lines = extractLines(res.data);
+        return { lines: lines, cands: CardMatch.candidates(state.index, lines, 4).filter(function (x) { return x.sim >= 0.5; }) };
+      });
+    }
+    // Read the title twice when the first read is not clearly right: once as smooth grey, once as hard black-and-white.
+    var pass = readMode('g').then(function (a) {
+      if (!window.Recognize || (a.cands.length && a.cands[0].sim >= 0.9)) return a;
+      return readMode('b').then(function (b) {
+        var byName = {};
+        a.cands.concat(b.cands).forEach(function (x) { if (!byName[x.name] || x.sim > byName[x.name].sim) byName[x.name] = x; });
+        var merged = Object.keys(byName).map(function (k) { return byName[k]; }).sort(function (p, q) { return q.sim - p.sim; }).slice(0, 4);
+        return { lines: a.lines.concat(b.lines), cands: merged };
+      });
+    });
+    return pass.then(function (res) {
+      var tOcr = performance.now() - t1, lines = res.lines, cands = res.cands;
       var hashes = null;
       if (cands.length && cands[0].sim < 0.97 && state.artIndex) hashes = Vision.artHashes(warped, v[1]);
       warped.delete(); warped = null;
@@ -451,6 +527,7 @@
         dbg({ path: 'card outline (' + quad.how + ') + title OCR', variant: vi, detect_ms: Math.round(tDet), ocr_ms: Math.round(tOcr),
               read: lines.map(function (l) { return l.text; }), best: r ? r.name + ' sim ' + r.m.sim.toFixed(2) + ' via ' + r.via + (r.dist !== undefined ? ' dist ' + r.dist : '') : 'none',
               candidates: r && r.table ? r.table : undefined, decision: name || (r ? 'waiting for a second look' : 'no match') });
+        state.quadFails = name ? 0 : (cands.length ? state.quadFails : (state.quadFails || 0) + 1);
         return afterMatch(name, r ? r.m : null, true, 0);
       });
     }).catch(function (e) { if (warped) warped.delete(); throw e; });

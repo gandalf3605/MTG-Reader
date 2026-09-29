@@ -1,4 +1,12 @@
-Spoken Card Reader - version 2
+Spoken Card Reader - version 3
+
+WHAT CHANGED IN V3
+- Card finding now evens out uneven light and shadows first, and uses adaptive edge detection, so it copes
+  with dim rooms, glare, sleeves and full-art cards much better.
+- If the outline is unclear it tries other candidate outlines (including other cards in view).
+- The name bar is read two ways (smooth grey and hard black-and-white) and the results are combined.
+- Very short card names now need a closer match before they are announced (fewer wrong guesses).
+- New file: js/recognize.js (upload it along with the rest).
 
 WHAT CHANGED IN V2
 - Finds the card in the camera picture, straightens it, and reads only the name bar (much faster).

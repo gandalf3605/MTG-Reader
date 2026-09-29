@@ -130,6 +130,7 @@
     var M = cv.getPerspectiveTransform(a, b);
     try { cv.warpPerspective(src, dst, M, new cv.Size(OUT_W, OUT_H), cv.INTER_LINEAR, cv.BORDER_REPLICATE); }
     finally { src.delete(); a.delete(); b.delete(); M.delete(); }
+    dst.srcH = Math.max(w, h); // how many real pixels tall the card was in the camera picture
     return dst;
   }
 
