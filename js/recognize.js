@@ -314,5 +314,16 @@
     return worker.setParameters({ tessedit_pageseg_mode: '7' }).then(function () { return worker.recognize(cvs, {}, { blocks: true }); }).then(function (r) { return extract(r.data); });
   }
 
-  root.Recognize = { VARIANTS: [[0, false], [0, true], [-0.02, false], [0.02, false], [-0.02, true], [0.02, true]], PER_MODE: [[0, false, 'g'], [0, true, 'g'], [0, false, 'b'], [0, true, 'b'], [-0.02, false, 'g'], [0.02, false, 'g'], [-0.02, true, 'g'], [0.02, true, 'g'], [-0.02, false, 'b'], [0.02, false, 'b']], detect: detect, titleCanvas: titleCanvas, readTitle: readTitle, extract: extract };
+  // How crisp a flattened card is (variance of the Laplacian); higher = sharper. Used to pick the best frame.
+  function sharpness(warped) {
+    var c = cv(), gray = new c.Mat(), lap = new c.Mat(), mean = new c.Mat(), sd = new c.Mat();
+    try {
+      c.cvtColor(warped, gray, c.COLOR_RGBA2GRAY);
+      c.Laplacian(gray, lap, c.CV_32F);
+      c.meanStdDev(lap, mean, sd);
+      var v = sd.data64F[0]; return v * v;
+    } finally { gray.delete(); lap.delete(); mean.delete(); sd.delete(); }
+  }
+
+  root.Recognize = { sharpness: sharpness, VARIANTS: [[0, false], [0, true], [-0.02, false], [0.02, false], [-0.02, true], [0.02, true]], PER_MODE: [[0, false, 'g'], [0, true, 'g'], [0, false, 'b'], [0, true, 'b'], [-0.02, false, 'g'], [0.02, false, 'g'], [-0.02, true, 'g'], [0.02, true, 'g'], [-0.02, false, 'b'], [0.02, false, 'b']], detect: detect, titleCanvas: titleCanvas, readTitle: readTitle, extract: extract };
 })(typeof self !== 'undefined' ? self : this);

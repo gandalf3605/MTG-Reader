@@ -3,7 +3,7 @@
   var $ = function (id) { return document.getElementById(id); };
   var el = {
     video: $('video'), status: $('status'), banner: $('banner'), stage: $('stage'), readout: $('readout'),
-    readName: $('readName'), readText: $('readText'), btnRepeat: $('btnRepeat'), btnPause: $('btnPause'),
+    readName: $('readName'), readText: $('readText'), btnRepeat: $('btnRepeat'), btnNext: $('btnNext'), btnPause: $('btnPause'),
     btnSlower: $('btnSlower'), btnFaster: $('btnFaster'), btnReminder: $('btnReminder'), btnTorch: $('btnTorch'),
     btnType: $('btnType'), btnAbout: $('btnAbout'), typeBox: $('typeBox'), typeInput: $('typeInput'),
     typeClose: $('typeClose'), about: $('about'), aboutClose: $('aboutClose'), fatal: $('fatal'),
@@ -19,6 +19,7 @@
     torch: false, current: null, lastSeenAt: 0, pending: { name: null, t: 0 }, voiceLocked: false,
     pendingSpeech: null, announceToken: 0, misses: 0, lastHelp: 0, modeIdx: 0, ready: false, welcomed: false,
     swallowClick: false, wake: null, suppressUntil: 0,
+    phase: 'seek', stable: 0, prevQuad: null, best: null, collected: 0, quadFails: 0, noQuadSince: 0, lastSeekHelp: 0,
     vision: false, artIndex: null, vTick: 0, vCursor: 0, vPref: null, noQuad: 0, unreadSince: 0, visionFails: 0, lastLookupMsg: 0
   };
 
@@ -78,7 +79,7 @@
     el.sr.textContent = '';
     var p = state.pendingSpeech; state.pendingSpeech = null;
     state.swallowClick = true; setTimeout(function () { state.swallowClick = false; }, 500);
-    speakNow(p || ['Ready. Hold a card upright, with its name at the top.']);
+    speakNow(p || ['Ready. Hold a card steady in front of the camera, with its name at the top. After it is read aloud, tap the screen for the next card.']);
   }
   ['pointerup', 'touchend', 'click', 'keydown'].forEach(function (evt) {
     document.addEventListener(evt, unlockVoice, true);
@@ -217,6 +218,7 @@
       }
       state.current = { name: name, card: card };
       state.lastSeenAt = Date.now();
+      state.phase = 'held';                       // stop scanning until the user asks for the next card
       render();
       setStatus(card.name);
       try { navigator.vibrate && navigator.vibrate(40); } catch (e) {}
@@ -332,12 +334,18 @@
   }
 
   // Two sightings needed unless `strong`. A miss never cancels a pending guess.
+  // Short names are easy to hit by accident from OCR noise, so they need a closer match.
+  function passesGuards(m) {
+    if (!m || m.sim < T_LOW) return false;
+    var half = m.name.indexOf(' // ') !== -1 && m.key !== CardMatch.compact(m.name); // matched only one side of a two-sided name
+    if (half && m.key.length <= 5 && m.sim < 0.99) return false;
+    if (m.key.length <= 4 && m.sim < 0.9) return false;
+    if (m.key.length < 7 && m.sim < 0.8) return false;
+    return true;
+  }
   function decide(m, forcePending) {
     var now = Date.now();
-    if (!m || m.sim < T_LOW) return null;
-    // Short names are easy to hit by accident from OCR noise, so they need a closer match.
-    if (m.key.length <= 4 && m.sim < 0.9) return null;
-    if (m.key.length < 7 && m.sim < 0.8) return null;
+    if (!passesGuards(m)) return null;
     var strong = !forcePending && m.sim >= T_HIGH && (m.key.length >= 5 || m.sim >= 0.999);
     if (strong) return m.name;
     if (state.pending.name === m.name && now - state.pending.t < 10000) { state.pending = { name: null, t: 0 }; return m.name; }
@@ -401,10 +409,10 @@
   var VARIANTS = window.Recognize ? Recognize.VARIANTS : [[0, false], [0, true], [-0.02, false], [0.02, false], [-0.02, true], [0.02, true]]; // [title crop shift, upside-down, 'g' grey | 'b' black-and-white]
   var Finder = window.Recognize || Vision;
   var fullC = document.createElement('canvas'), detC = document.createElement('canvas');
-  function drawFrames() {
+  function drawFrames(hi) {
     var vw = el.video.videoWidth, vh = el.video.videoHeight;
     if (!vw || !vh) return null;
-    var s1 = Math.min(1, 1280 / Math.max(vw, vh));
+    var s1 = Math.min(1, (hi ? 1920 : 1280) / Math.max(vw, vh));
     fullC.width = Math.round(vw * s1); fullC.height = Math.round(vh * s1);
     fullC.getContext('2d', { willReadFrequently: true }).drawImage(el.video, 0, 0, fullC.width, fullC.height);
     var s2 = Math.min(1, 640 / Math.max(fullC.width, fullC.height));
@@ -456,6 +464,14 @@
     return getPrintIds(card).then(function (ids) { return ids.length ? Vision.distanceTo(state.artIndex, hashes, ids) : null; }).catch(function () { return null; });
   }
 
+  // Same, but waits for the card's data and printings (used once per captured card, where waiting is fine).
+  function hashDistanceWait(name, hashes) {
+    return getCard(name).then(function (card) {
+      if (!card || /Basic Land/.test(card.type_line || '')) return null;
+      return getPrintIds(card).then(function (ids) { return ids.length ? Vision.distanceTo(state.artIndex, hashes, ids) : null; });
+    }).catch(function () { return null; });
+  }
+
   // Turn title candidates (+ optional art hashes) into {name, m, strong}.
   function evaluate(cands, hashes) {
     if (!cands.length) return Promise.resolve(null);
@@ -478,68 +494,129 @@
     });
   }
 
-  function scanCard() {
-    var f = drawFrames();
+  /* ----- staged capture: see a card -> wait until it is steady -> keep the sharpest frame -> read that still ----- */
+  function dropBest() { if (state.best) { try { state.best.mat.delete(); } catch (e) {} state.best = null; } state.collected = 0; }
+  function center(p) { return { x: (p[0].x + p[1].x + p[2].x + p[3].x) / 4, y: (p[0].y + p[1].y + p[2].y + p[3].y) / 4 }; }
+  function sameQuad(a, b, diag) {
+    if (!a || !b) return false;
+    var ca = center(a.pts), cb = center(b.pts);
+    var w = function (q) { return Math.hypot(q.pts[0].x - q.pts[1].x, q.pts[0].y - q.pts[1].y) + Math.hypot(q.pts[1].x - q.pts[2].x, q.pts[1].y - q.pts[2].y); };
+    var r = w(a) / Math.max(1, w(b));
+    return Math.hypot(ca.x - cb.x, ca.y - cb.y) < 0.04 * diag && r > 0.87 && r < 1.15;
+  }
+
+  function seekStep() {
+    var f = drawFrames(state.stable >= 2);
     if (!f) return Promise.resolve();
-    var t0 = performance.now(), quad = Finder.detect(detC), tDet = performance.now() - t0;
+    var t0 = performance.now(), quad = Finder.detect(detC), tDet = performance.now() - t0, now = Date.now();
+    if (quad && quad.others && quad.others.length) { var pool = [quad].concat(quad.others); quad = pool[state.quadFails % pool.length]; }
     if (!quad) {
-      state.noQuad++;
-      dbg({ path: 'no card outline found', detect_ms: Math.round(tDet), fallbacks: Math.floor(state.noQuad / 4) });
-      state.unreadSince = 0;
-      return state.noQuad % 4 === 0 ? scanFullFrame() : Promise.resolve();
+      state.stable = 0; state.prevQuad = null; dropBest();
+      if (!state.noQuadSince) state.noQuadSince = now;
+      setStatus('Looking for a card…');
+      dbg({ phase: 'seek', path: 'no card outline found', detect_ms: Math.round(tDet) });
+      if (now - state.noQuadSince > 12000 && now - state.lastSeekHelp > 30000) {
+        state.lastSeekHelp = now;
+        say(["I can't see a card. Hold it flat and upright in the box, with light on it."]);
+      }
+      return Promise.resolve();
     }
-    state.noQuad = 0;
-    // When the main outline yields nothing readable, give the other candidate outlines (other cards in view) a turn, two looks each.
-    if (quad.others && quad.others.length) { var pool = [quad].concat(quad.others); quad = pool[Math.floor((state.quadFails || 0) / 2) % pool.length]; }
+    state.noQuadSince = 0;
+    var diag = Math.hypot(detC.width, detC.height);
+    if (sameQuad(state.prevQuad, quad, diag)) state.stable++; else { state.stable = 1; dropBest(); }
+    state.prevQuad = quad;
+    if (state.stable < 3) { setStatus('Card found. Hold still…'); dbg({ phase: 'steadying', stable: state.stable, detect_ms: Math.round(tDet) }); return Promise.resolve(); }
+    // steady: flatten this frame and keep it if it is the sharpest so far
     var warped = Vision.warp(fullC, quad.pts, 1 / f.ds);
-    var vi = nextVariantIdx(), v = VARIANTS[vi], t1 = performance.now();
-    function readMode(mode) {
+    var sh = Finder.sharpness ? Finder.sharpness(warped) : 0;
+    if (!state.best || sh > state.best.sh) { if (state.best) state.best.mat.delete(); state.best = { mat: warped, sh: sh, how: quad.how }; }
+    else warped.delete();
+    state.collected++;
+    dbg({ phase: 'capturing', collected: state.collected, sharpness: Math.round(sh), detect_ms: Math.round(tDet) });
+    if (state.collected < 4) return Promise.resolve();
+    var shot = state.best; state.best = null; state.collected = 0; state.stable = 0; state.prevQuad = null;
+    try { navigator.vibrate && navigator.vibrate(25); } catch (e) {}   // "shutter" tick: the picture is taken
+    setStatus('Reading the card…');
+    state.phase = 'reading';
+    return readStill(shot).then(function () { if (state.phase === 'reading' || state.phase === 'announcing') state.phase = 'seek'; },
+      function (e) { if (state.phase !== 'held') state.phase = 'seek'; throw e; });
+  }
+
+  // Work order for one captured card: [title shift, upside-down, 'g' grey | 'b' black-and-white]
+  var TASKS = [[0, false, 'g'], [0, true, 'g'], [0, false, 'b'], [0, true, 'b'], [-0.02, false, 'g'], [0.02, false, 'g'], [-0.02, true, 'g'], [0.02, true, 'g'],
+               [-0.02, false, 'b'], [0.02, false, 'b'], [-0.02, true, 'b'], [0.02, true, 'b']];
+  function readStill(shot) {
+    var warped = shot.mat, t0 = performance.now(), votes = {}, seen = [], flipLock = null, i = 0, ran = 0, strong = null;
+    function ocr(task) {
       var c;
-      try { c = Finder.titleCanvas(warped, v[1], v[0], mode); } catch (e) { return Promise.reject(e); }
+      try { c = Finder.titleCanvas(warped, task[1], task[0], task[2]); } catch (e) { return Promise.reject(e); }
       return state.worker.setParameters({ tessedit_pageseg_mode: '7' }).then(function () {
         return state.worker.recognize(c, {}, { blocks: true });
       }).then(function (res) {
         var lines = extractLines(res.data);
-        return { lines: lines, cands: CardMatch.candidates(state.index, lines, 4).filter(function (x) { return x.sim >= 0.5; }) };
+        lines.forEach(function (l) { seen.push(l.text); });
+        return CardMatch.candidates(state.index, lines, 4).filter(function (x) { return x.sim >= 0.5; });
       });
     }
-    // Read the title twice when the first read is not clearly right: once as smooth grey, once as hard black-and-white.
-    var pass = readMode('g').then(function (a) {
-      if (!window.Recognize || (a.cands.length && a.cands[0].sim >= 0.9)) return a;
-      return readMode('b').then(function (b) {
-        var byName = {};
-        a.cands.concat(b.cands).forEach(function (x) { if (!byName[x.name] || x.sim > byName[x.name].sim) byName[x.name] = x; });
-        var merged = Object.keys(byName).map(function (k) { return byName[k]; }).sort(function (p, q) { return q.sim - p.sim; }).slice(0, 4);
-        return { lines: a.lines.concat(b.lines), cands: merged };
+    function next() {
+      if (i >= TASKS.length) return Promise.resolve();
+      var task = TASKS[i++];
+      if (flipLock !== null && task[1] !== flipLock) return next();          // once one orientation reads, stop trying the other
+      ran++;
+      return ocr(task).then(function (cands) {
+        cands.forEach(function (m) {
+          var v = votes[m.name] || (votes[m.name] = { m: m, count: 0, flip: task[1] });
+          v.count++;
+          if (m.sim > v.m.sim) { v.m = m; v.flip = task[1]; }
+        });
+        if (cands.length && cands[0].sim >= 0.7 && flipLock === null) flipLock = task[1];
+        var top = cands[0];
+        if (top && top.sim >= 0.97 && top.key.length >= 5) { strong = votes[top.name]; return; }
+        var agreed = Object.keys(votes).map(function (k) { return votes[k]; }).filter(function (v) { return v.count >= 2 && passesGuards(v.m); })
+          .sort(function (p, q) { return q.m.sim - p.m.sim; })[0];
+        if (agreed && agreed.m.sim >= 0.8) { strong = agreed; return; }
+        return next();
       });
-    });
-    return pass.then(function (res) {
-      var tOcr = performance.now() - t1, lines = res.lines, cands = res.cands;
+    }
+    return next().then(function () {
+      var ranked = Object.keys(votes).map(function (k) { return votes[k]; }).sort(function (p, q) { return (q.count - p.count) || (q.m.sim - p.m.sim); });
+      var firm = strong || ranked.filter(function (v) { return passesGuards(v.m) && v.m.sim >= 0.9; })[0] || null;
+      var soft = firm ? null : ranked.filter(function (v) { return passesGuards(v.m); })[0] || null;   // plausible but not sure: needs a second look
+      var pick = firm || soft;
       var hashes = null;
-      if (cands.length && cands[0].sim < 0.97 && state.artIndex) hashes = Vision.artHashes(warped, v[1]);
-      warped.delete(); warped = null;
-      return evaluate(cands, hashes).then(function (r) {
+      if (pick && pick.m.sim < 0.97 && state.artIndex) { try { hashes = Vision.artHashes(warped, pick.flip); } catch (e) { hashes = null; } }
+      var check = pick && hashes ? hashDistanceWait(pick.m.name, hashes) : Promise.resolve(null);
+      return check.then(function (dist) {
+        warped.delete();
+        var contradicted = dist !== null && dist >= 460 && pick.m.sim < 0.9 && pick.count < 3;   // artwork clearly differs and the title is only so-so
         var name = null;
-        if (r) {
-          name = r.strong ? r.name : decide(r.m, true);
-          if (name) state.vPref = vi;
-        }
-        dbg({ path: 'card outline (' + quad.how + ') + title OCR', variant: vi, detect_ms: Math.round(tDet), ocr_ms: Math.round(tOcr),
-              read: lines.map(function (l) { return l.text; }), best: r ? r.name + ' sim ' + r.m.sim.toFixed(2) + ' via ' + r.via + (r.dist !== undefined ? ' dist ' + r.dist : '') : 'none',
-              candidates: r && r.table ? r.table : undefined, decision: name || (r ? 'waiting for a second look' : 'no match') });
-        state.quadFails = name ? 0 : (cands.length ? state.quadFails : (state.quadFails || 0) + 1);
-        return afterMatch(name, r ? r.m : null, true, 0);
+        if (pick && !contradicted && now_ok()) name = firm ? firm.m.name : decide(soft.m, true);
+        dbg({ phase: 'read', path: 'captured still (' + shot.how + ')', sharpness: Math.round(shot.sh), tries: ran, ms: Math.round(performance.now() - t0),
+              read: seen.slice(0, 12), best: ranked[0] ? ranked[0].m.name + ' sim ' + ranked[0].m.sim.toFixed(2) + ' x' + ranked[0].count + (dist !== null ? ' art ' + dist : '') : 'none',
+              decision: name || (contradicted ? 'artwork disagrees' : soft ? 'waiting for a second look' : 'no match') });
+        if (name) { state.quadFails = 0; state.phase = 'announcing'; return afterMatch(name, pick.m, true, 0); }
+        state.quadFails++;
+        return afterMatch(null, ranked[0] ? ranked[0].m : null, true, 0);
       });
-    }).catch(function (e) { if (warped) warped.delete(); throw e; });
+    }, function (e) { try { warped.delete(); } catch (x) {} throw e; });
+  }
+  function now_ok() { return Date.now() >= state.suppressUntil; }
+
+  function scanNext() {
+    state.announceToken++;                // ignore any lookup still in flight
+    state.current = null; state.pending = { name: null, t: 0 }; state.suppressUntil = 0;
+    state.phase = 'seek'; state.stable = 0; state.prevQuad = null; state.quadFails = 0; state.unreadSince = 0; state.noQuadSince = 0;
+    dropBest(); render();
+    setStatus('Looking for a card…');
+    say(['Ready. Show the next card.']);
   }
 
-  function scanOnce() { return state.vision ? scanCard() : scanFullFrame(); }
+  function scanOnce() { return state.vision ? seekStep() : scanFullFrame(); }
 
   function loop() {
     if (!state.ready) return;
-    if (state.paused || document.hidden || !state.stream) { setTimeout(loop, 400); return; }
+    if (state.paused || document.hidden || !state.stream || state.phase !== 'seek') { setTimeout(loop, 300); return; }
     scanOnce().then(function () { state.visionFails = 0; }, function () {
-      // If the fast path keeps crashing, quietly go back to plain whole-frame reading.
       if (state.vision && ++state.visionFails >= 5) { state.vision = false; dbg({ path: 'card finder turned off after errors' }); }
     }).then(function () { setTimeout(loop, state.vision ? 60 : 200); });
   }
@@ -554,8 +631,11 @@
   el.btnSlower.addEventListener('click', function () { changeRate(-1); });
   el.btnFaster.addEventListener('click', function () { changeRate(1); });
   el.btnRepeat.addEventListener('click', function () { if (!state.swallowClick) repeat(); });
-  el.stage.addEventListener('click', function () { if (!state.swallowClick) repeat(); });
-  el.stage.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); repeat(); } });
+  el.btnNext.addEventListener('click', function () { if (!state.swallowClick) scanNext(); });
+  // Tapping the camera view: after a card has been read it means "next card"; while looking it does nothing.
+  function stageTap() { if (state.swallowClick) return; if (state.phase === 'held') scanNext(); }
+  el.stage.addEventListener('click', stageTap);
+  el.stage.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); stageTap(); } });
 
   el.btnPause.addEventListener('click', function () {
     state.paused = !state.paused;
@@ -655,7 +735,7 @@
       setStatus('Scanning… hold a card up');
       if (!state.welcomed) {
         state.welcomed = true;
-        say(['Ready. Hold a card upright, with its name at the top.']);
+        say(['Ready. Hold a card steady in front of the camera, with its name at the top. After it is read aloud, tap the screen for the next card.']);
       }
       loop();
       loadVision();

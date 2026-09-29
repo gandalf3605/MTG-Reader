@@ -1,4 +1,14 @@
-Spoken Card Reader - version 3
+Spoken Card Reader - version 4
+
+WHAT CHANGED IN V4
+- The reader no longer reads live video constantly. It now works in stages:
+  see a card outline > wait until the card is steady > keep the sharpest frame > clean it up >
+  read the name several ways and check the artwork > read the card aloud > STOP.
+- After a card is read, scanning stops. Tap anywhere on the camera view, or the big yellow
+  "Scan next card" button, to clear it and look for the next card. "Repeat" says the card again.
+- A vibration tick means the picture was taken: hold still until the voice starts.
+
+WHAT CHANGED IN V3
 
 WHAT CHANGED IN V3
 - Card finding now evens out uneven light and shadows first, and uses adaptive edge detection, so it copes
